@@ -1,73 +1,83 @@
-import streamlit as st
-import pdfplumber
-import pandas as pd
 import re
+from decimal import Decimal, ROUND_HALF_UP
 
-st.set_page_config(page_title="WB отчёты", layout="wide")
+import pandas as pd
+import pdfplumber
+import streamlit as st
 
-st.title("Расчёт суммы (п.1 + п.3 + п.4 + п.5) по отчётам WB")
+RUB = Decimal("0.01")
+
+# Денежное число в формате WB: "1 547 596,71" или "150,00"
+# Важно: не схватывает "21 486799449 1 547 596,71" целиком — возьмёт только "1 547 596,71"
+MONEY_RE = re.compile(r"(?<!\d)(\d+(?:[ \u00a0]\d{3})*,\d{2})(?!\d)")
+
+
+def to_decimal(s: str) -> Decimal:
+    if not s:
+        return Decimal("0")
+    s = s.strip()
+    if s in {"—", "-", "–"}:
+        return Decimal("0")
+    s = s.replace("\u00a0", " ").replace(" ", "").replace(",", ".")
+    try:
+        return Decimal(s)
+    except Exception:
+        return Decimal("0")
+
+
+def read_pdf_text(file) -> str:
+    with pdfplumber.open(file) as pdf:
+        return "\n".join((page.extract_text() or "") for page in pdf.pages)
+
+
+def fmt_rub(x: Decimal) -> str:
+    x = x.quantize(RUB, rounding=ROUND_HALF_UP)
+    s = f"{x:.2f}"
+    whole, frac = s.split(".")
+    whole = re.sub(r"(?<=\d)(?=(\d{3})+$)", " ", whole)
+    return f"{whole},{frac} ₽"
+
+
+def find_line_and_amount(text: str, keyword: str):
+    """
+    Возвращает (найденная_строка, сумма).
+    Сумму берём как ПОСЛЕДНЕЕ денежное значение в строке (обычно WB ставит сумму в конце).
+    """
+    for line in text.splitlines():
+        if keyword.lower() in line.lower():
+            m = MONEY_RE.findall(line)
+            if not m:
+                # если WB ставит "—" вместо суммы
+                if "—" in line or " - " in line or "–" in line:
+                    return line, Decimal("0")
+                return line, Decimal("0")
+
+            # берём последнее денежное значение
+            val = to_decimal(m[-1])
+
+            # защита от мусора (на всякий случай): WB-суммы не бывают триллионами
+            if val > Decimal("1000000000"):  # 1 млрд
+                # если вдруг строка странная — попробуем выбрать самое маленькое из найденных
+                vals = [to_decimal(x) for x in m]
+                vals = [v for v in vals if v <= Decimal("1000000000")]
+                if vals:
+                    return line, min(vals)
+                return line, Decimal("0")
+
+            return line, val
+
+    return "", Decimal("0")
+
+
+# ---------------- UI ----------------
+st.set_page_config(page_title="WB Налоги", layout="wide")
+st.title("Расчёт суммы (п.1 + п.3 + п.4 + п.5) по отчетам WB")
 st.caption("Загрузите PDF-отчёты Wildberries (только .pdf, без .sig)")
 
-
-# ---------- helpers ----------
-
-def to_float(value: str) -> float:
-    value = value.replace(" ", "").replace(",", ".")
-    try:
-        return float(value)
-    except:
-        return 0.0
-
-
-def extract_money_from_line(line: str) -> float:
-    """
-    Берём ТОЛЬКО последнее денежное значение в строке
-    вида 1 279 714,01
-    """
-    matches = re.findall(r"\d[\d\s]*,\d{2}", line)
-    if not matches:
-        return 0.0
-
-    value = to_float(matches[-1])
-
-    # защита от мусора (WB отчёты всегда < 1 млрд)
-    if value > 1_000_000_000:
-        return 0.0
-
-    return value
-
-
-def find_value(lines, keywords):
-    for line in lines:
-        if any(k.lower() in line.lower() for k in keywords):
-            val = extract_money_from_line(line)
-            if val > 0:
-                return val
-    return 0.0
-
-
-def parse_pdf(file):
-    with pdfplumber.open(file) as pdf:
-        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
-
-    lines = text.split("\n")
-
-    p1 = find_value(lines, ["стоимость реализованного товара"])
-    p3 = find_value(lines, ["вознаграждение вайлдберриз"])
-    p4 = find_value(lines, ["возврат товаров"])
-    p5 = find_value(lines, ["корректировка", "удержание"])
-
-    total = p1 + p3 + p4 + p5
-
-    return p1, p3, p4, p5, total
-
-
-# ---------- UI ----------
-
 files = st.file_uploader(
-    "Загрузите PDF-отчёты",
+    "Загрузите PDF-отчеты Wildberries",
     type=["pdf"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
 )
 
 tax_rate = st.number_input(
@@ -75,33 +85,49 @@ tax_rate = st.number_input(
     min_value=0.0,
     max_value=100.0,
     value=6.0,
-    step=0.1
+    step=0.5,
 )
+
+debug = st.checkbox("Показать отладку (какие строки найдены)", value=False)
+
+# Ключевые строки ровно как в твоём WB-PDF
+K1 = "Итого стоимость реализованного товара"
+K3 = "Удержания в пользу третьих лиц"
+K4 = "Компенсация ущерба"
+K5 = "Прочие выплаты"
 
 if files:
     rows = []
+    debug_blocks = []
 
     for f in files:
-        p1, p3, p4, p5, total = parse_pdf(f)
+        text = read_pdf_text(f)
 
-        rows.append({
-            "Файл": f.name,
-            "П.1": round(p1, 2),
-            "П.3": round(p3, 2),
-            "П.4": round(p4, 2),
-            "П.5": round(p5, 2),
-            "Итого": round(total, 2),
-        })
+        l1, p1 = find_line_and_amount(text, K1)
+        l3, p3 = find_line_and_amount(text, K3)
+        l4, p4 = find_line_and_amount(text, K4)
+        l5, p5 = find_line_and_amount(text, K5)
 
-    df = pd.DataFrame(rows)
+        total = (p1 + p3 + p4 + p5).quantize(RUB)
 
-    st.dataframe(df, use_container_width=True)
+        rows.append(
+            {
+                "Файл": f.name,
+                "П.1": float(p1),
+                "П.3": float(p3),
+                "П.4": float(p4),
+                "П.5": float(p5),
+                "Итого": float(total),
+            }
+        )
 
-    grand_total = df["Итого"].sum()
-    tax_value = grand_total * tax_rate / 100
-
-    st.markdown(f"### Общая сумма: **{grand_total:,.2f} ₽**")
-    st.markdown(f"### Налог ({tax_rate:.1f}%): **{tax_value:,.2f} ₽**")
-
-else:
-    st.info("Загрузите один или несколько PDF-файлов отчётов WB")
+        if debug:
+            debug_blocks.append(
+                {
+                    "file": f.name,
+                    "p1_line": l1,
+                    "p3_line": l3,
+                    "p4_line": l4,
+                    "p5_line": l5,
+                    "p1": str(p1),
+                    "p3": str(p3),
