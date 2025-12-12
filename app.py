@@ -5,18 +5,16 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
+# ---------- CONFIG ----------
+st.set_page_config(page_title="WB Налоги", layout="wide")
 RUB = Decimal("0.01")
 
-# Денежное число в формате WB: "1 547 596,71" или "150,00"
-# Важно: не схватывает "21 486799449 1 547 596,71" целиком — возьмёт только "1 547 596,71"
+# Денежное число WB: 1 279 714,01
 MONEY_RE = re.compile(r"(?<!\d)(\d+(?:[ \u00a0]\d{3})*,\d{2})(?!\d)")
 
-
+# ---------- HELPERS ----------
 def to_decimal(s: str) -> Decimal:
     if not s:
-        return Decimal("0")
-    s = s.strip()
-    if s in {"—", "-", "–"}:
         return Decimal("0")
     s = s.replace("\u00a0", " ").replace(" ", "").replace(",", ".")
     try:
@@ -40,37 +38,27 @@ def fmt_rub(x: Decimal) -> str:
 
 def find_line_and_amount(text: str, keyword: str):
     """
-    Возвращает (найденная_строка, сумма).
-    Сумму берём как ПОСЛЕДНЕЕ денежное значение в строке (обычно WB ставит сумму в конце).
+    Ищем строку по ключевым словам и берём ПОСЛЕДНЕЕ денежное значение в строке
     """
     for line in text.splitlines():
         if keyword.lower() in line.lower():
-            m = MONEY_RE.findall(line)
-            if not m:
-                # если WB ставит "—" вместо суммы
-                if "—" in line or " - " in line or "–" in line:
-                    return line, Decimal("0")
+            matches = MONEY_RE.findall(line)
+            if not matches:
                 return line, Decimal("0")
 
-            # берём последнее денежное значение
-            val = to_decimal(m[-1])
+            value = to_decimal(matches[-1])
 
-            # защита от мусора (на всякий случай): WB-суммы не бывают триллионами
-            if val > Decimal("1000000000"):  # 1 млрд
-                # если вдруг строка странная — попробуем выбрать самое маленькое из найденных
-                vals = [to_decimal(x) for x in m]
-                vals = [v for v in vals if v <= Decimal("1000000000")]
-                if vals:
-                    return line, min(vals)
-                return line, Decimal("0")
+            # защита от мусора (WB суммы < 1 млрд)
+            if value > Decimal("1000000000"):
+                valid = [to_decimal(x) for x in matches if to_decimal(x) <= Decimal("1000000000")]
+                value = min(valid) if valid else Decimal("0")
 
-            return line, val
+            return line, value
 
     return "", Decimal("0")
 
 
-# ---------------- UI ----------------
-st.set_page_config(page_title="WB Налоги", layout="wide")
+# ---------- UI ----------
 st.title("Расчёт суммы (п.1 + п.3 + п.4 + п.5) по отчетам WB")
 st.caption("Загрузите PDF-отчёты Wildberries (только .pdf, без .sig)")
 
@@ -90,12 +78,13 @@ tax_rate = st.number_input(
 
 debug = st.checkbox("Показать отладку (какие строки найдены)", value=False)
 
-# Ключевые строки ровно как в твоём WB-PDF
+# Ключевые строки WB
 K1 = "Итого стоимость реализованного товара"
 K3 = "Удержания в пользу третьих лиц"
 K4 = "Компенсация ущерба"
 K5 = "Прочие выплаты"
 
+# ---------- PROCESS ----------
 if files:
     rows = []
     debug_blocks = []
@@ -110,24 +99,61 @@ if files:
 
         total = (p1 + p3 + p4 + p5).quantize(RUB)
 
-        rows.append(
-            {
-                "Файл": f.name,
-                "П.1": float(p1),
-                "П.3": float(p3),
-                "П.4": float(p4),
-                "П.5": float(p5),
-                "Итого": float(total),
-            }
-        )
+        rows.append({
+            "Файл": f.name,
+            "П.1": float(p1),
+            "П.3": float(p3),
+            "П.4": float(p4),
+            "П.5": float(p5),
+            "Итого": float(total),
+        })
 
         if debug:
-            debug_blocks.append(
-                {
-                    "file": f.name,
-                    "p1_line": l1,
-                    "p3_line": l3,
-                    "p4_line": l4,
-                    "p5_line": l5,
-                    "p1": str(p1),
-                    "p3": str(p3),
+            debug_blocks.append({
+                "file": f.name,
+                "p1_line": l1,
+                "p1": str(p1),
+                "p3_line": l3,
+                "p3": str(p3),
+                "p4_line": l4,
+                "p4": str(p4),
+                "p5_line": l5,
+                "p5": str(p5),
+            })
+
+    df = pd.DataFrame(rows)
+
+    # Красивый вывод
+    pretty = df.copy()
+    for c in ["П.1", "П.3", "П.4", "П.5", "Итого"]:
+        pretty[c] = pretty[c].apply(lambda x: fmt_rub(Decimal(str(x))))
+
+    st.dataframe(pretty, use_container_width=True)
+
+    grand_total = Decimal(str(df["Итого"].sum())).quantize(RUB)
+    tax = (grand_total * Decimal(str(tax_rate)) / Decimal("100")).quantize(RUB)
+
+    st.markdown(f"### Общая сумма: **{fmt_rub(grand_total)}**")
+    st.markdown(f"### Налог ({tax_rate}%): **{fmt_rub(tax)}**")
+
+    if debug:
+        st.subheader("Отладка (что именно найдено в PDF)")
+        for b in debug_blocks:
+            st.markdown(f"**{b['file']}**")
+            st.code(
+                f"""П.1 строка: {b['p1_line']}
+П.1 сумма : {b['p1']}
+
+П.3 строка: {b['p3_line']}
+П.3 сумма : {b['p3']}
+
+П.4 строка: {b['p4_line']}
+П.4 сумма : {b['p4']}
+
+П.5 строка: {b['p5_line']}
+П.5 сумма : {b['p5']}
+""",
+                language="text",
+            )
+else:
+    st.info("Загрузите один или несколько PDF-файлов отчётов WB")
