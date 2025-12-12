@@ -1,68 +1,61 @@
 import streamlit as st
 import pdfplumber
-import re
 import pandas as pd
+import re
 
 st.set_page_config(page_title="WB отчёты", layout="wide")
 
 st.title("Расчёт суммы (п.1 + п.3 + п.4 + п.5) по отчётам WB")
 st.caption("Загрузите PDF-отчёты Wildberries (только .pdf, без .sig)")
 
+
 # ---------- helpers ----------
 
-def parse_money(text: str) -> float:
-    """
-    Преобразует строку вида:
-    1 279 714,01
-    56 157,57
-    в float
-    """
-    if not text:
-        return 0.0
-    text = text.replace(" ", "").replace(",", ".")
+def to_float(value: str) -> float:
+    value = value.replace(" ", "").replace(",", ".")
     try:
-        return float(text)
+        return float(value)
     except:
         return 0.0
 
 
-def extract_value(lines, keywords):
+def extract_money_from_line(line: str) -> float:
     """
-    Ищет строку по ключевым словам и вытаскивает число
+    Берём ТОЛЬКО последнее денежное значение в строке
+    вида 1 279 714,01
     """
+    matches = re.findall(r"\d[\d\s]*,\d{2}", line)
+    if not matches:
+        return 0.0
+
+    value = to_float(matches[-1])
+
+    # защита от мусора (WB отчёты всегда < 1 млрд)
+    if value > 1_000_000_000:
+        return 0.0
+
+    return value
+
+
+def find_value(lines, keywords):
     for line in lines:
         if any(k.lower() in line.lower() for k in keywords):
-            match = re.search(r"([\d\s]+,\d{2})", line)
-            if match:
-                return parse_money(match.group(1))
+            val = extract_money_from_line(line)
+            if val > 0:
+                return val
     return 0.0
 
 
 def parse_pdf(file):
-    p1 = p3 = p4 = p5 = 0.0
-
     with pdfplumber.open(file) as pdf:
         text = "\n".join(page.extract_text() or "" for page in pdf.pages)
 
     lines = text.split("\n")
 
-    # ⚠️ Ключевые формулировки WB (проверены на реальных отчётах)
-    p1 = extract_value(lines, [
-        "стоимость реализованного товара",
-    ])
-
-    p3 = extract_value(lines, [
-        "вознаграждение вайлдберриз",
-    ])
-
-    p4 = extract_value(lines, [
-        "возврат товаров",
-    ])
-
-    p5 = extract_value(lines, [
-        "корректировка",
-        "удержание",
-    ])
+    p1 = find_value(lines, ["стоимость реализованного товара"])
+    p3 = find_value(lines, ["вознаграждение вайлдберриз"])
+    p4 = find_value(lines, ["возврат товаров"])
+    p5 = find_value(lines, ["корректировка", "удержание"])
 
     total = p1 + p3 + p4 + p5
 
@@ -102,10 +95,7 @@ if files:
 
     df = pd.DataFrame(rows)
 
-    st.dataframe(
-        df,
-        use_container_width=True
-    )
+    st.dataframe(df, use_container_width=True)
 
     grand_total = df["Итого"].sum()
     tax_value = grand_total * tax_rate / 100
