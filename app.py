@@ -1,16 +1,13 @@
 import re
 from decimal import Decimal, ROUND_HALF_UP
-import pandas as pd
 import pdfplumber
+import pandas as pd
 import streamlit as st
 
-RUB_DEC = Decimal("0.01")
+RUB = Decimal("0.01")
 
-def parse_rub_amount(s: str) -> Decimal:
-    if not s:
-        return Decimal("0")
-    s = s.strip()
-    if s in {"—", "-", "–"}:
+def to_decimal(s: str) -> Decimal:
+    if not s or s.strip() in {"—", "-", "–"}:
         return Decimal("0")
     s = s.replace(" ", "").replace("\u00a0", "").replace(",", ".")
     try:
@@ -18,29 +15,27 @@ def parse_rub_amount(s: str) -> Decimal:
     except:
         return Decimal("0")
 
-def extract_point_amount(text: str, point: int) -> Decimal:
-    pattern = rf"(?m)^\\s*{point}\\.(?!\\d).*?$"
-    m = re.search(pattern, text)
-    if not m:
-        return Decimal("0")
-    line = m.group(0)
-    nums = re.findall(r"\\d[\\d\\s\u00a0]*,\\d{{2}}", line)
-    if not nums:
-        return Decimal("0")
-    return parse_rub_amount(nums[-1])
+def find_amount(text: str, keyword: str) -> Decimal:
+    for line in text.splitlines():
+        if keyword.lower() in line.lower():
+            nums = re.findall(r"\d[\d\s\u00a0]*,\d{2}", line)
+            if nums:
+                return to_decimal(nums[-1])
+            return Decimal("0")
+    return Decimal("0")
 
-def read_pdf_text(file):
+def read_pdf(file) -> str:
     with pdfplumber.open(file) as pdf:
         return "\n".join(page.extract_text() or "" for page in pdf.pages)
 
-def rub_fmt(x: Decimal) -> str:
-    q = x.quantize(RUB_DEC, rounding=ROUND_HALF_UP)
-    s = f"{q:.2f}"
-    whole, frac = s.split(".")
-    whole = re.sub(r"(?<=\\d)(?=(\\d{3})+$)", " ", whole)
-    return f"{whole},{frac} ₽"
+def fmt(x: Decimal) -> str:
+    x = x.quantize(RUB, rounding=ROUND_HALF_UP)
+    s = f"{x:.2f}"
+    a, b = s.split(".")
+    a = re.sub(r"(?<=\d)(?=(\d{3})+$)", " ", a)
+    return f"{a},{b} ₽"
 
-st.set_page_config(page_title="WB налоги", layout="wide")
+st.set_page_config(page_title="WB Налоги", layout="wide")
 st.title("Расчёт суммы (п.1 + п.3 + п.4 + п.5) по отчетам WB")
 
 files = st.file_uploader(
@@ -60,32 +55,34 @@ tax_rate = st.number_input(
 if files:
     rows = []
     for f in files:
-        text = read_pdf_text(f)
-        a1 = extract_point_amount(text, 1)
-        a3 = extract_point_amount(text, 3)
-        a4 = extract_point_amount(text, 4)
-        a5 = extract_point_amount(text, 5)
-        total = (a1 + a3 + a4 + a5).quantize(RUB_DEC)
+        text = read_pdf(f)
+
+        p1 = find_amount(text, "Итого стоимость реализованного товара")
+        p3 = find_amount(text, "Удержания в пользу третьих лиц")
+        p4 = find_amount(text, "Компенсация ущерба")
+        p5 = find_amount(text, "Прочие выплаты")
+
+        total = (p1 + p3 + p4 + p5).quantize(RUB)
 
         rows.append({
             "Файл": f.name,
-            "П.1": float(a1),
-            "П.3": float(a3),
-            "П.4": float(a4),
-            "П.5": float(a5),
-            "Итого": float(total)
+            "П.1": float(p1),
+            "П.3": float(p3),
+            "П.4": float(p4),
+            "П.5": float(p5),
+            "Итого": float(total),
         })
 
     df = pd.DataFrame(rows)
 
     show = df.copy()
     for c in ["П.1", "П.3", "П.4", "П.5", "Итого"]:
-        show[c] = show[c].apply(lambda x: rub_fmt(Decimal(str(x))))
+        show[c] = show[c].apply(lambda x: fmt(Decimal(str(x))))
 
     st.dataframe(show, use_container_width=True)
 
-    grand_total = Decimal(str(df["Итого"].sum())).quantize(RUB_DEC)
-    st.markdown(f"### Общая сумма: **{rub_fmt(grand_total)}**")
+    grand = Decimal(str(df["Итого"].sum())).quantize(RUB)
+    tax = (grand * Decimal(str(tax_rate)) / Decimal("100")).quantize(RUB)
 
-    tax = (grand_total * Decimal(str(tax_rate)) / Decimal("100")).quantize(RUB_DEC)
-    st.markdown(f"### Налог ({tax_rate}%): **{rub_fmt(tax)}**")
+    st.markdown(f"### Общая сумма: **{fmt(grand)}**")
+    st.markdown(f"### Налог ({tax_rate}%): **{fmt(tax)}**")
